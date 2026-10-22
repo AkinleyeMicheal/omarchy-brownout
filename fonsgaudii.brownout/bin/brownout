@@ -1,0 +1,446 @@
+#!/bin/bash
+# brownout — control CLI for the brownout power-profile plugin.
+#
+#   brownout on|off|auto      set mode (on = force profile, off = suppress auto,
+#                             auto = normal hysteresis behaviour)
+#   brownout toggle           cycle auto -> on -> off -> auto
+#   brownout release          one-shot: roll back the profile now, stay in auto
+#   brownout threshold [N]    show or set the auto-engage battery percentage (5-50)
+#   brownout status [--json]  current state (mode, engaged, reason, battery, ...)
+#   brownout top [--json] [--limit N] [--live]
+#                             rank user services by CPU/energy use (24h + a
+#                             on-battery 7d metric); --live adds a 2s live CPU%
+#   brownout pause-toggle <unit>    add/remove a unit from the pause list
+#   brownout pause-add|pause-remove <unit>
+#   brownout reapply          re-apply profile actions (used by theme-set hook)
+#   brownout simulate <unplug|plug|low|low <pct>|recover|clear>
+#                             test the state machine without touching the cable
+#   brownout doctor           environment / installation health check
+#   brownout log [-n N]       tail the audit log
+#   brownout fallback-engage <pct>   battery-low hook entry (daemon-dead fallback)
+
+set -uo pipefail
+
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+PLUGIN_DIR=$(dirname "$SELF_DIR")
+# shellcheck source=../lib/brownout-lib.bash
+source "$PLUGIN_DIR/lib/brownout-lib.bash"
+
+usage() {
+  awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+  exit "${1:-0}"
+}
+
+daemon_running() {
+  pgrep -u "$USER" -f 'brownout-watch' >/dev/null 2>&1
+}
+
+# --- mode commands ------------------------------------------------------------
+
+cmd_on() {
+  bl_lock_acquire || exit 1
+  bl_state_set '.mode = "on"'
+  bl_engage "forced on" forced
+  bl_lock_release
+  echo "brownout: on (profile applied)"
+}
+
+cmd_off() {
+  bl_lock_acquire || exit 1
+  bl_state_set '.mode = "off"'
+  bl_release "forced off"
+  bl_lock_release
+  echo "brownout: off (auto-engagement suppressed)"
+}
+
+cmd_auto() {
+  bl_lock_acquire || exit 1
+  bl_state_set '.mode = "auto"'
+  # Evaluate current conditions once so `auto` takes effect immediately,
+  # using the same trigger rules as the watcher.
+  local on_bat pct now unplugged_at
+  on_bat=$(bl_on_battery)
+  pct=$(bl_battery_pct)
+  now=$(date +%s)
+  if [[ $on_bat == 1 ]]; then
+    unplugged_at=$(bl_state_get '.unplugged_at' 0)
+    if [[ ${unplugged_at:-0} -eq 0 ]]; then
+      bl_state_set ".unplugged_at = $now"
+      unplugged_at=$now
+    fi
+    if [[ $pct =~ ^[0-9]+$ && $pct -le $ENGAGE_THRESHOLD ]]; then
+      bl_engage "battery at ${pct}%" low
+    elif [[ $((now - unplugged_at)) -ge $UNPLUG_GRACE_SECONDS ]]; then
+      bl_engage "unplugged from AC" unplug
+    else
+      bl_release "back to auto"
+    fi
+  else
+    bl_state_set '.unplugged_at = 0'
+    bl_release "back to auto"
+  fi
+  bl_lock_release
+  echo "brownout: auto"
+}
+
+cmd_toggle() {
+  case $(bl_state_get '.mode' auto) in
+  auto) cmd_on ;;
+  on) cmd_off ;;
+  *) cmd_auto ;;
+  esac
+}
+
+cmd_release() {
+  bl_lock_acquire || exit 1
+  bl_state_set '.mode = "auto"'
+  bl_release "manual release"
+  # A manual release is an explicit override for this unplug episode; do not
+  # let the watcher re-engage it as soon as the grace timer allows. A new
+  # unplug starts a fresh episode.
+  if [[ $(bl_on_battery) == 1 ]]; then
+    bl_state_set '.unplug_handled = true'
+  fi
+  bl_lock_release
+  echo "brownout: released (mode auto)"
+}
+
+# --- status -------------------------------------------------------------------
+
+cmd_status() {
+  if [[ ${1:-} == --json ]]; then
+    jq --arg daemon "$(daemon_running && echo true || echo false)" \
+      '. + {daemon_running: ($daemon == "true")}' "$BROWNOUT_STATE_FILE" 2>/dev/null
+    return
+  fi
+  local mode engaged reason pct on_bat paused
+  mode=$(bl_state_get '.mode' auto)
+  engaged=$(bl_state_get '.engaged' false)
+  reason=$(bl_state_get '.reason' "")
+  pct=$(bl_state_get '.battery_pct' "?")
+  on_bat=$(bl_state_get '.on_battery' 0)
+  paused=$(bl_state_get '.profile.paused | join(", ")' "")
+  echo "mode:      $mode"
+  echo "engaged:   $engaged${reason:+ ($reason)}"
+  echo "power:     $([[ $on_bat == 1 ]] && echo "on battery" || echo "plugged in"), battery ${pct}%"
+  echo "paused:    ${paused:-nothing}"
+  echo "daemon:    $(daemon_running && echo running || echo NOT RUNNING)"
+}
+
+# --- top / insights ------------------------------------------------------------
+
+cmd_top() {
+  local json=0 limit=$TOP_LIMIT live=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --json) json=1 ;;
+    --limit) limit=$2; shift ;;
+    --live) live=1 ;;
+    *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  # Text mode: plain table straight from the reporter (no live column).
+  if ((json == 0)); then
+    python3 "$PLUGIN_DIR/lib/brownout-report.py" top --file "$BROWNOUT_USAGE_FILE" \
+      --limit "$limit" --blocklist-regex "$BROWNOUT_PAUSE_BLOCKLIST_REGEX"
+    return
+  fi
+
+  # JSON mode: merge a 2s live CPU% sample and the current selection flags.
+  local live_json="{}"
+  if ((live)); then
+    local a b
+    a=$(read_cpu_ns)
+    sleep 2
+    b=$(read_cpu_ns)
+    live_json=$(compute_live "$a" "$b" 2)
+  fi
+
+  local rows paused_json known_json
+  rows=$(python3 "$PLUGIN_DIR/lib/brownout-report.py" top --file "$BROWNOUT_USAGE_FILE" --json \
+    --limit "$limit" --blocklist-regex "$BROWNOUT_PAUSE_BLOCKLIST_REGEX")
+  paused_json=$(bl_state_get '.paused_config' '[]')
+  # Usage history outlives removed units (14 days). Drop rows that no longer
+  # correspond to an installed or loaded user unit, so the popup cannot offer
+  # a checkbox for a service that cannot be paused.
+  known_json=$(
+    {
+      systemctl --user list-unit-files --type=service --no-legend --plain 2>/dev/null
+      systemctl --user list-units --type=service --all --no-legend --plain 2>/dev/null
+    } | awk 'NF {print $1}' | sort -u | jq -R . | jq -cs .
+  )
+  # Always include paused units even when they fell out of the top-N after
+  # being stopped (zero recent CPU), otherwise their checkbox becomes
+  # unreachable and they can only be unpaused from the CLI.
+  jq -n --argjson rows "$rows" --argjson live "$live_json" \
+    --argjson paused "$paused_json" --argjson known "$known_json" '
+    def is_known($id): (($known | length) == 0) or ($known | index($id) != null);
+    $rows
+    | .units as $units
+    | .units = (
+        ($units
+          | map(select(is_known(.id)))
+          | map(. + {
+              live_cpu_pct: ($live[.id] // null),
+              selected: (.id as $i | $paused | index($i) != null)
+            }))
+        + ([ $paused[] as $u
+             | select(($units | map(.id) | index($u)) == null)
+             | {id: $u, name: ($u | sub("\\.service$"; "")), cpu_pct_24h: 0,
+                cpu_min_24h: 0, batt_cpu_min_7d: 0, mem_mb: 0,
+                live_cpu_pct: null, selected: true} ]
+          )
+      )'
+}
+
+read_cpu_ns() {
+  systemctl --user list-units --type=service --all --no-legend --plain 2>/dev/null |
+    awk '{print $1}' |
+    while IFS= read -r u; do
+      [[ -z $u ]] && continue
+      ns=$(systemctl --user show "$u" -p CPUUsageNSec --value 2>/dev/null)
+      [[ $ns =~ ^[0-9]+$ ]] && printf '%s %s\n' "$u" "$ns"
+    done
+}
+
+compute_live() {
+  # compute_live <snapshotA> <snapshotB> <seconds> -> {"unit": cpu_pct}
+  local a=$1 b=$2 secs=$3
+  awk -v s="$secs" 'NR==FNR { prev[$1] = $2; next }
+    ($1 in prev) { d = $2 - prev[$1]; if (d < 0) d = 0; printf "%s %.2f\n", $1, d / 1e9 / s * 100 }
+  ' <(echo "$a") <(echo "$b") |
+    jq -Rn '[inputs | split(" ") | {(.[0]): (.[1] | tonumber)}] | add // {}'
+}
+
+# --- pause list management ------------------------------------------------------
+
+conf_set_key() {
+  # conf_set_key KEY VALUE — replace the uncommented KEY= line (append if absent).
+  local key=$1 value=$2 tmp
+  bl_ensure_dirs
+  touch "$BROWNOUT_CONFIG"
+  tmp=$(mktemp "$BROWNOUT_CONFIG.XXXXXX")
+  awk -v key="$key" -v val="$value" '
+    BEGIN { done = 0 }
+    $0 ~ "^" key "=" {
+      if (!done) { print key "=" val; done = 1 }
+      next
+    }
+    { print }
+    END { if (!done) print key "=" val }
+  ' "$BROWNOUT_CONFIG" >"$tmp" && mv "$tmp" "$BROWNOUT_CONFIG"
+}
+
+cmd_threshold() {
+  bl_config_load
+  if [[ -z ${1:-} ]]; then
+    echo "$ENGAGE_THRESHOLD"
+    return 0
+  fi
+  local value=$1 old_release
+  if ! [[ $value =~ ^[0-9]+$ ]] || ((value < 5 || value > 50)); then
+    echo "brownout: threshold must be an integer between 5 and 50" >&2
+    exit 1
+  fi
+  old_release=$(awk -F= '/^RELEASE_THRESHOLD=/{print $2; exit}' "$BROWNOUT_CONFIG" 2>/dev/null)
+  conf_set_key ENGAGE_THRESHOLD "$value"
+  # Keep hysteresis room only when the configured release would be too low.
+  if ! [[ $old_release =~ ^[0-9]+$ ]] || ((old_release <= value)); then
+    conf_set_key RELEASE_THRESHOLD "$((value + 5))"
+  fi
+  bl_config_load
+  bl_lock_acquire || exit 1
+  bl_state_set ".engage_threshold = $ENGAGE_THRESHOLD | .release_threshold = $RELEASE_THRESHOLD"
+  bl_lock_release
+  echo "brownout: auto-engage at ${ENGAGE_THRESHOLD}% (release at ${RELEASE_THRESHOLD}%)"
+}
+
+conf_rewrite_pause_list() {
+  # conf_rewrite_pause_list "<new space-separated list>"
+  local new_list=$1
+  bl_ensure_dirs
+  touch "$BROWNOUT_CONFIG"
+  local tmp
+  tmp=$(mktemp "$BROWNOUT_CONFIG.XXXXXX")
+  awk -v val="$new_list" '
+    BEGIN { done = 0 }
+    /^PAUSE_SERVICES=/ {
+      if (!done) { print "PAUSE_SERVICES=\"" val "\""; done = 1 }
+      next
+    }
+    { print }
+    END { if (!done) print "PAUSE_SERVICES=\"" val "\"" }
+  ' "$BROWNOUT_CONFIG" >"$tmp" && mv "$tmp" "$BROWNOUT_CONFIG"
+  bl_lock_acquire || return 1
+  bl_state_set '.paused_config = $p' --argjson p "$(echo "$new_list" | tr ' ' '\n' | jq -R . | jq -cs 'map(select(length>0))')"
+  bl_lock_release
+}
+
+pause_list_get() {
+  bl_config_load
+  echo "$PAUSE_SERVICES"
+}
+
+cmd_pause_set() {
+  # cmd_pause_set <add|remove> <unit>
+  local op=$1 unit=$2
+  [[ $unit =~ ^[A-Za-z0-9@._-]+\.service$ ]] || {
+    echo "brownout: '$unit' does not look like a systemd user unit" >&2
+    exit 1
+  }
+  if [[ $unit =~ $BROWNOUT_PAUSE_BLOCKLIST_REGEX ]]; then
+    echo "brownout: '$unit' is on the never-pause blocklist (session/audio core)" >&2
+    exit 1
+  fi
+  local list
+  list=$(pause_list_get)
+  case $op in
+  add)
+    [[ " $list " == *" $unit "* ]] && {
+      echo "brownout: $unit already in pause list"
+      exit 0
+    }
+    list="${list:+$list }$unit"
+    ;;
+  remove)
+    list=$(echo "$list" | tr ' ' '\n' | grep -vxF "$unit" | tr '\n' ' ' | sed 's/ *$//')
+    ;;
+  esac
+  conf_rewrite_pause_list "$list"
+  echo "brownout: pause list = [${list:-<empty>}]"
+  if [[ $(bl_state_get '.engaged' false) == true ]]; then
+    echo "brownout: note: changes apply from the next engage (currently engaged)"
+  fi
+}
+
+cmd_pause_toggle() {
+  local unit=$1
+  bl_config_load
+  if [[ " $PAUSE_SERVICES " == *" $unit "* ]]; then
+    cmd_pause_set remove "$unit"
+  else
+    cmd_pause_set add "$unit"
+  fi
+}
+
+# --- misc -----------------------------------------------------------------------
+
+cmd_reapply() {
+  bl_lock_acquire || exit 1
+  bl_reapply
+  bl_lock_release
+}
+
+cmd_simulate() {
+  bl_ensure_dirs
+  case ${1:-clear} in
+  unplug) echo '{"on_battery":1}' >"$BROWNOUT_SIM_FILE" ;;
+  plug) echo '{"on_battery":0}' >"$BROWNOUT_SIM_FILE" ;;
+  low)
+    pct=${2:-15}
+    echo "{\"on_battery\":1,\"pct\":$pct}" >"$BROWNOUT_SIM_FILE"
+    ;;
+  recover)
+    pct=${2:-80}
+    echo "{\"on_battery\":0,\"pct\":$pct}" >"$BROWNOUT_SIM_FILE"
+    ;;
+  clear) rm -f "$BROWNOUT_SIM_FILE" ;;
+  *)
+    echo "Usage: brownout simulate <unplug|plug|low [pct]|recover [pct]|clear>" >&2
+    exit 1
+    ;;
+  esac
+  echo "brownout: simulate -> ${1:-clear} ${2:-} (takes effect on the next poll, ${POLL_SECONDS}s)"
+}
+
+cmd_fallback_engage() {
+  # Invoked by the battery-low hook when Omarchy's own battery service fires.
+  # Only acts when the watcher is dead — otherwise the watcher owns thresholds.
+  if daemon_running; then
+    exit 0
+  fi
+  bl_lock_acquire || exit 1
+  if [[ $(bl_state_get '.mode' auto) == auto && $(bl_state_get '.engaged' false) != true ]]; then
+    bl_engage "battery-low fallback (${1:-?}%)" low
+  fi
+  bl_lock_release
+}
+
+cmd_doctor() {
+  local fail=0
+  printf '%-28s %s\n' "check" "result"
+  printf '%-28s %s\n' "----------------------------" "--------------------------------"
+  for c in jq busctl systemctl powerprofilesctl brightnessctl hyprctl iw upower python3 notify-send; do
+    if command -v "$c" >/dev/null 2>&1; then
+      printf '%-28s %s\n' "$c" "ok"
+    else
+      printf '%-28s %s\n' "$c" "MISSING"
+      [[ $c == jq || $c == busctl || $c == systemctl ]] && fail=1
+    fi
+  done
+  printf '%-28s %s\n' "omarchy notification" \
+    "$(command -v omarchy-notification-send >/dev/null 2>&1 && echo ok || echo MISSING)"
+  printf '%-28s %s\n' "upower OnBattery" \
+    "$(busctl get-property org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPower OnBattery 2>/dev/null || echo UNAVAILABLE)"
+  printf '%-28s %s\n' "battery %" "$(bl_raw_battery_pct || echo UNKNOWN)"
+  local hypr_sig
+  if hypr_sig=$(bl_hypr_sig) && bl_hyprctl version >/dev/null 2>&1; then
+    printf '%-28s %s\n' "hyprctl ipc" "ok ($hypr_sig)"
+  else
+    printf '%-28s %s\n' "hyprctl ipc" "UNAVAILABLE — blur/animation actions will be skipped"
+    fail=1
+  fi
+  printf '%-28s %s\n' "ppd profile" "$(powerprofilesctl get 2>/dev/null || echo UNKNOWN)"
+  printf '%-28s %s\n' "config" "$([[ -r $BROWNOUT_CONFIG ]] && echo "$BROWNOUT_CONFIG" || echo "absent (defaults will be used)")"
+  printf '%-28s %s\n' "state" "$BROWNOUT_STATE_FILE"
+  printf '%-28s %s\n' "daemon" "$(daemon_running && echo running || echo 'NOT RUNNING (sudo systemctl --user enable --now fonsgaudii-brownout)')"
+  printf '%-28s %s\n' "~/.local/bin on PATH" \
+    "$([[ ":$PATH:" == *":$HOME/.local/bin:"* ]] && echo yes || echo 'NO — brownout command will not resolve')"
+  if [[ $WIFI_POWER_SAVE == true ]]; then
+    if timeout 3 sudo -n true 2>/dev/null; then
+      printf '%-28s %s\n' "wifi power save" "enabled; passwordless sudo ok"
+    else
+      printf '%-28s %s\n' "wifi power save" "ENABLED but sudo will prompt — see README"
+      fail=1
+    fi
+  fi
+  local engaged mode
+  engaged=$(bl_state_get '.engaged' false)
+  mode=$(bl_state_get '.mode' auto)
+  printf '%-28s %s\n' "mode/engaged" "$mode / $engaged"
+  exit $fail
+}
+
+cmd_log() {
+  local n=40
+  [[ ${1:-} == -n ]] && n=${2:-40}
+  tail -n "$n" "$BROWNOUT_LOG_FILE" 2>/dev/null || echo "no log yet"
+}
+
+# --- dispatch --------------------------------------------------------------------
+
+bl_config_load
+bl_state_init
+
+case ${1:-} in
+on) cmd_on ;;
+off) cmd_off ;;
+auto) cmd_auto ;;
+toggle) cmd_toggle ;;
+release) cmd_release ;;
+status) shift; cmd_status "$@" ;;
+threshold) shift; cmd_threshold "$@" ;;
+top) shift; cmd_top "$@" ;;
+pause-toggle) shift; cmd_pause_toggle "$@" ;;
+pause-add) shift; cmd_pause_set add "${1:?unit required}" ;;
+pause-remove) shift; cmd_pause_set remove "${1:?unit required}" ;;
+reapply) cmd_reapply ;;
+simulate) shift; cmd_simulate "$@" ;;
+doctor) cmd_doctor ;;
+log) shift; cmd_log "$@" ;;
+fallback-engage) shift; cmd_fallback_engage "$@" ;;
+-h | --help | help) usage 0 ;;
+*) usage 1 ;;
+esac

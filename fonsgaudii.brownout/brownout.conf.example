@@ -1,0 +1,61 @@
+# brownout configuration — copy to ~/.config/brownout.conf and edit.
+# This file is sourced by bash: KEY=value, quote strings, no spaces around =.
+
+# ---- trigger thresholds -----------------------------------------------------
+# Engage when the battery (while discharging) drops to this percentage.
+ENGAGE_THRESHOLD=20
+# Release once the battery recovers to this percentage after a *low-battery*
+# engagement (the hysteresis gap). A real AC return always releases, after the
+# short debounce below. An unplug engagement never exits on this percentage:
+# the pack is discharging, so the level is above the threshold by definition.
+RELEASE_THRESHOLD=25
+# Wait this long after unplugging before engaging, so a brief unplug
+# (moving to a café table, a cable wiggle) does not nuke the desktop.
+UNPLUG_GRACE_SECONDS=10
+# Require AC to be present this many seconds before releasing. Guards against
+# a single glitchy UPower "plugged in" poll bouncing the profile.
+AC_RELEASE_SECONDS=3
+
+# ---- profile actions --------------------------------------------------------
+# Dim to this brightness percentage (only if currently brighter). Uses Omarchy's
+# brightness command so you get the on-screen indicator.
+BRIGHTNESS_FLOOR_PCT=25
+# Strip compositor blur, shadows, animations, and window transparency while
+# engaged (each original value is restored on release). Client-side
+# transparency configured inside an app (e.g. a terminal) is not affected.
+DISABLE_BLUR=true
+DISABLE_SHADOWS=true
+DISABLE_TRANSPARENCY=true
+DISABLE_ANIMATIONS=true
+# Switch power-profiles-daemon to power-saver while engaged.
+USE_POWER_SAVER=true
+# Turn the keyboard backlight off (no-op on hardware without one).
+KEYBOARD_BACKLIGHT_OFF=true
+
+# ---- services to pause ------------------------------------------------------
+# Space-separated systemd --user units stopped while brownout is engaged and
+# resumed on release. EMPTY BY DEFAULT: pick units from `brownout top` or the
+# bar widget popup, which shows real usage metrics to inform the choice.
+# Never-pause units (pipewire, dbus, portals, the session itself...) are
+# blocked regardless of what you put here.
+PAUSE_SERVICES=""
+
+# ---- optional extras (off by default) ---------------------------------------
+# Wi-Fi power save via `iw`. Needs a passwordless sudo rule for `iw` — see the
+# README "Wi-Fi power save" section; it is never enabled out of the box.
+WIFI_POWER_SAVE=false
+WIFI_INTERFACE=""            # empty = autodetect first wifi iface
+
+# Cap the built-in display refresh rate while engaged, e.g. 60 on a
+# 165Hz panel, or `auto` to pick the lowest advertised mode at the current
+# resolution. Causes a visible mode switch, hence opt-in. 0 = disabled.
+REFRESH_RATE_HZ=0
+
+# ---- notifications / tuning -------------------------------------------------
+NOTIFY=true                  # engage/release desktop notifications
+POLL_SECONDS=5               # power-state poll cadence
+SAMPLE_INTERVAL_SECONDS=60   # usage sampler cadence (pause-chooser history)
+HISTORY_RETENTION_DAYS=14    # usage history retention
+COMPACT_RAW_HOURS=48         # raw (1-min) samples kept this long, then hourly
+TOP_LIMIT=8                  # rows shown in `brownout top` / the popup
+LOG_MAX_LINES=5000           # audit log cap

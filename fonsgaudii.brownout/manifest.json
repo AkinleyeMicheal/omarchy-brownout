@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "fonsgaudii.brownout",
+  "name": "Brownout",
+  "version": "1.1.0",
+  "author": "fonsgaudii",
+  "description": "Battery brownout mode: on unplug or low battery, apply an emergency profile — dim display, strip compositor effects, power-saver, pause user-chosen services. With hysteresis, a usage-ranked pause chooser, an adjustable trigger threshold, manual overrides and a bar widget.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Brownout",
+    "description": "Brownout mode indicator: status, mode switch, and the pause chooser",
+    "category": "Power",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5,
+      "topLimit": 8
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "topLimit",
+        "type": "integer",
+        "label": "Pause-chooser rows",
+        "min": 3,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 8
+      }
+    ]
+  }
+}

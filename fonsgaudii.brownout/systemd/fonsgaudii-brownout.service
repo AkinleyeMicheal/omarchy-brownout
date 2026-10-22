@@ -1,0 +1,15 @@
+[Unit]
+Description=Brownout mode watcher (battery emergency profile)
+Documentation=file:%h/.config/omarchy/plugins/fonsgaudii.brownout/README.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/fonsgaudii.brownout/bin/brownout-watch
+Restart=on-failure
+RestartSec=5
+# The watcher is a tiny poller; keep it out of the way on battery.
+Nice=10
+
+[Install]
+WantedBy=default.target

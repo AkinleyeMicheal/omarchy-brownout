@@ -1,0 +1,169 @@
+#!/bin/bash
+# brownout-watch — the brownout state-machine daemon.
+#
+# Polls power state (UPower via busctl), maintains hysteresis + grace logic,
+# applies/releases the brownout profile, samples per-unit resource usage, and
+# keeps ~/.local/state/brownout/state.json fresh for the bar widget.
+#
+# Mode contract (state.json .mode):
+#   auto  engage on unplug (after grace) or battery <= ENGAGE_THRESHOLD;
+#         release on debounced AC return, or battery recovery after a
+#         low-battery engagement (never for an unplug engagement)
+#   on    force-engage, ignore release conditions
+#   off   suppress auto-engagement entirely
+#
+# All profile mutations happen under flock so the CLI and daemon never race.
+
+set -uo pipefail
+
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+PLUGIN_DIR=$(dirname "$SELF_DIR")
+# shellcheck source=../lib/brownout-lib.bash
+source "$PLUGIN_DIR/lib/brownout-lib.bash"
+
+COMPACT_EVERY_SECONDS=21600 # 6h
+
+trap 'bl_log INFO "watcher stopping"; exit 0' TERM INT
+
+bl_config_load
+bl_state_init
+bl_ensure_dirs
+bl_state_set ".engage_threshold = $ENGAGE_THRESHOLD | .release_threshold = $RELEASE_THRESHOLD"
+bl_log INFO "watcher starting (engage<=${ENGAGE_THRESHOLD}% release>=${RELEASE_THRESHOLD}% grace=${UNPLUG_GRACE_SECONDS}s)"
+
+last_sample=0
+last_compact=0
+
+# --- one evaluation tick -----------------------------------------------------
+
+evaluate() {
+  local config_changed=0
+  bl_config_reload_if_changed && config_changed=1
+
+  local on_bat pct mode engaged now
+  local unplugged_at plugged_at unplug_handled trigger
+  on_bat=$(bl_on_battery)
+  pct=$(bl_battery_pct)
+  [[ $pct =~ ^[0-9]+$ ]] || pct=-1
+  now=$(date +%s)
+
+  bl_lock_acquire || return 0
+  if [[ $config_changed == 1 ]]; then
+    bl_state_set ".engage_threshold = $ENGAGE_THRESHOLD | .release_threshold = $RELEASE_THRESHOLD"
+    bl_log INFO "config reloaded (engage<=${ENGAGE_THRESHOLD}% release>=${RELEASE_THRESHOLD}%)"
+  fi
+
+  mode=$(bl_state_get '.mode' auto)
+  engaged=$(bl_state_get '.engaged' false)
+  unplugged_at=$(bl_state_get '.unplugged_at' 0)
+  plugged_at=$(bl_state_get '.plugged_at' 0)
+  unplug_handled=$(bl_state_get '.unplug_handled' false)
+  trigger=$(bl_state_get '.trigger' "")
+
+  # Track both power edges. The AC edge is debounced by AC_RELEASE_SECONDS so
+  # a single spurious "plugged in" poll cannot release — and then re-engage —
+  # the profile. unplug_handled marks an unplug episode as already consumed.
+  if [[ $on_bat == 1 ]]; then
+    if [[ ${unplugged_at:-0} -eq 0 ]]; then
+      bl_state_set ".unplugged_at = $now | .plugged_at = 0 | .unplug_handled = false | .on_battery = 1 | .battery_pct = $pct"
+      unplugged_at=$now
+      plugged_at=0
+      unplug_handled=false
+    else
+      bl_state_set ".plugged_at = 0 | .on_battery = 1 | .battery_pct = $pct"
+      plugged_at=0
+    fi
+  else
+    if [[ ${plugged_at:-0} -eq 0 ]]; then
+      bl_state_set ".plugged_at = $now | .unplugged_at = 0 | .on_battery = 0 | .battery_pct = $pct"
+      plugged_at=$now
+      unplugged_at=0
+    else
+      bl_state_set ".unplugged_at = 0 | .on_battery = 0 | .battery_pct = $pct"
+      unplugged_at=0
+    fi
+  fi
+
+  case $mode in
+  on)
+    [[ $engaged == true ]] || bl_engage "forced on" forced
+    ;;
+  off)
+    [[ $engaged == true ]] && bl_release "forced off"
+    ;;
+  auto)
+    if [[ $engaged != true ]]; then
+      if [[ $on_bat == 1 ]]; then
+        if [[ $pct -ge 0 && $pct -le $ENGAGE_THRESHOLD ]]; then
+          bl_engage "battery at ${pct}%" low
+        elif [[ ${unplugged_at:-0} -gt 0 && $unplug_handled != true &&
+          $((now - unplugged_at)) -ge $UNPLUG_GRACE_SECONDS ]]; then
+          bl_engage "unplugged from AC" unplug
+        fi
+      fi
+    else
+      if [[ $on_bat == 0 ]]; then
+        if ((plugged_at > 0 && now - plugged_at >= AC_RELEASE_SECONDS)); then
+          bl_release "plugged in"
+        fi
+      elif [[ $trigger == low && $pct -ge $RELEASE_THRESHOLD ]]; then
+        # Only a low-battery engagement can exit through "battery recovered".
+        # Applying this check to an unplug engagement is the flap bug: after
+        # unplugging at 48% the profile would release immediately because
+        # 48 >= 25, then the grace timer would engage it again six seconds
+        # later, forever.
+        bl_release "battery recovered to ${pct}%"
+      fi
+    fi
+    ;;
+  esac
+
+  bl_lock_release
+}
+
+# --- startup reconcile --------------------------------------------------------
+# Heal after reboots/crashes: honor the persisted mode, never trust a stale
+# "engaged" flag on a machine that is clearly fine now.
+
+reconcile() {
+  bl_lock_acquire || return 0
+  local mode
+  mode=$(bl_state_get '.mode' auto)
+  case $mode in
+  on) bl_engage "forced on (reconcile)" ;;
+  off) bl_release "forced off (reconcile)" ;;
+  auto)
+    # A reboot/crash must not inherit a stale "episode handled" flag: if we
+    # are on battery in auto and not engaged, let the normal evaluation
+    # decide (after the usual unplug grace period).
+    if [[ $(bl_on_battery) == 1 && $(bl_state_get '.engaged' false) != true ]]; then
+      bl_state_set '.unplug_handled = false'
+    fi
+    # In auto, re-derive from current conditions synchronously.
+    bl_lock_release
+    evaluate
+    return 0
+    ;;
+  esac
+  bl_lock_release
+}
+
+reconcile
+
+# --- main loop ----------------------------------------------------------------
+
+while true; do
+  evaluate
+
+  now=$(date +%s)
+  if ((now - last_sample >= SAMPLE_INTERVAL_SECONDS)); then
+    bl_sample_units || true
+    last_sample=$now
+  fi
+  if ((now - last_compact >= COMPACT_EVERY_SECONDS)); then
+    bl_compact_usage "$PLUGIN_DIR/lib" || true
+    last_compact=$now
+  fi
+
+  sleep "$POLL_SECONDS"
+done
