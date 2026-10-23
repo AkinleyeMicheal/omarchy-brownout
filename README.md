@@ -111,6 +111,17 @@ any time you want to re-sync an installed copy.)
 4. Test risk-free: `brownout simulate unplug`, watch a full engage/restore
    cycle, then `brownout simulate clear`.
 
+### Updating
+
+```bash
+omarchy plugin update fonsgaudii.brownout --yes
+~/.config/omarchy/plugins/fonsgaudii.brownout/install.sh   # re-wire unit, hooks, binding
+```
+
+The installed dir stays a git checkout of this repo, so the standard plugin
+update command works; re-running `install.sh` afterwards re-syncs the systemd
+unit, hooks and keybinding.
+
 ### Removal
 
 ```bash
