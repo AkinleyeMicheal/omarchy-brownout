@@ -519,6 +519,12 @@ bl_action_wifi_apply() {
     bl_log INFO "wifi power save: no interface found"
     return 0
   }
+  # Interface names flow into argv of a passwordless-root iw call and into the
+  # state snapshot: only accept plain connector names.
+  if ! [[ $iface =~ ^[A-Za-z0-9._-]+$ ]]; then
+    bl_log WARN "wifi power save: refusing odd interface name '$iface'"
+    return 0
+  fi
   # Never block on a password prompt inside the daemon: sudo -n only.
   if ! timeout 3 sudo -n true 2>/dev/null; then
     bl_log WARN "wifi power save enabled in config but passwordless sudo is unavailable; see README"

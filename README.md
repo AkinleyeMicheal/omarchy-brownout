@@ -274,6 +274,32 @@ youruser ALL=(ALL) NOPASSWD: /usr/bin/timeout 5 /usr/bin/iw *
 then set `WIFI_POWER_SAVE=true` in `~/.config/brownout.conf`. The previous
 interface setting is restored on release.
 
+## Security posture
+
+Brownout is unsandboxed (like all Omarchy plugins), so its attack surface is
+kept deliberately small:
+
+- **No network access of any kind** — no HTTP clients, no socket usage beyond
+  the local Hyprland UNIX IPC socket; there is no SSRF or code-execution from
+  remote content because no remote content is ever read. The only fetch this
+  repo participates in is Omarchy's own `omarchy plugin update`.
+- **Runs as your user, zero privilege** — no root, no polkit, no setuid. The
+  single sudo touchpoint is the opt-in `iw` power-save feature, guarded by
+  `sudo -n` (it never prompts inside the daemon) and a sudo rule *you* install.
+- **All callers validated before interpolation** — systemd unit names must
+  match a strict charset and the never-pause blocklist before they can enter
+  config or state; percentages, refresh rates and monitor names are
+  regex-validated before reaching shell/hyprctl/eval; the QML popup spawns the
+  CLI by absolute path, never through the ambient `PATH`.
+- **Atomic writes only** — state, stats and config rewrites go through
+  temp-file + `rename`, and the NUL-padded-file integrity check in
+  `install.sh` rejects corrupted copies before they take over.
+- **No secrets, no telemetry** — nothing is uploaded, ever; the audit log lives
+  under `~/.local/state/brownout/`.
+- One trust boundary to know: `~/.config/brownout.conf` is a bash-sourced
+  KEY=value file. Like everything else under `~/.config`, it should only be
+  edited by you.
+
 ## Testing
 
 ```bash

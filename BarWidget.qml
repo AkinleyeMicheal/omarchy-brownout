@@ -103,9 +103,11 @@ BarWidget {
 
   // No --live here: a 2 s CPU sample would leave the popup empty for four
   // seconds on every open. The popup only needs the historical metrics.
+  // Spawn the installed CLI by absolute path: never resolve `brownout` through
+  // the ambient PATH of the shell process.
   Process {
     id: topProc
-    command: ["brownout", "top", "--json", "--limit", String(root.setting("topLimit", 8))]
+    command: [Quickshell.env("HOME") + "/.local/bin/brownout", "top", "--json", "--limit", String(root.setting("topLimit", 8))]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.candidates = Model.parseTop(text)

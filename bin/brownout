@@ -361,9 +361,12 @@ cmd_fallback_engage() {
   if daemon_running; then
     exit 0
   fi
+  # The level lands in log/state strings; only honor plain percentages.
+  local level=${1:-?}
+  [[ $level =~ ^[0-9]+$ ]] || level='?'
   bl_lock_acquire || exit 1
   if [[ $(bl_state_get '.mode' auto) == auto && $(bl_state_get '.engaged' false) != true ]]; then
-    bl_engage "battery-low fallback (${1:-?}%)" low
+    bl_engage "battery-low fallback (${level}%)" low
   fi
   bl_lock_release
 }
