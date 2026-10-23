@@ -12,7 +12,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 REPO=$PWD
-PLUGIN="$REPO/fonsgaudii.brownout"
+PLUGIN="$REPO"
 [[ -x $PLUGIN/bin/brownout ]] || { echo "sandbox: plugin not found at $PLUGIN" >&2; exit 2; }
 
 PASS=0

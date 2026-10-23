@@ -57,6 +57,7 @@ ok() { printf '    \033[1;32m✓\033[0m %s\n' "$*"; }
 remove() {
   say "removing $PLUGIN_ID"
   systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+  omarchy-shell shell setPluginEnabled "$PLUGIN_ID" false >/dev/null 2>&1 || true
   rm -f "$UNIT_DEST" "$BIN_LINK"
   rm -rf "$DEST"
   rm -f "$HOME/.config/omarchy/hooks/theme-set.d/theme-set-reapply.sh" \
@@ -82,7 +83,8 @@ mkdir -p "$HOME/.config/omarchy/plugins" "$HOME/.local/bin"
 tmp="$DEST.new.$$"
 rm -rf "$tmp"
 mkdir -p "$tmp"
-(cd "$SRC" && tar --exclude=.git --exclude=install.sh --exclude=__pycache__ --exclude='*.pyc' -cf - .) | (cd "$tmp" && tar -xf -)
+(cd "$SRC" && tar --exclude=.git --exclude=install.sh --exclude=tests --exclude=screenshots \
+  --exclude=.gitignore --exclude=LICENSE --exclude=README.md --exclude=__pycache__ --exclude='*.pyc' -cf - .) | (cd "$tmp" && tar -xf -)
 chmod +x "$tmp"/bin/* "$tmp"/hooks/*.sh
 # A previous interrupted copy left a zero-padded file behind; refuse to install
 # anything empty or carrying NUL padding.
