@@ -1,23 +1,16 @@
-# Brownout for Omarchy
+# Brownout (`fonsgaudii.brownout`)
 
-![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.1.0-green)
-![Platform](https://img.shields.io/badge/Omarchy-Hyprland%20Quattro-purple)
-
-**Battery brownout mode for Omarchy.** When your laptop unplugs or its battery
-drops low, Brownout quietly applies an emergency power profile — dim the
-display, strip compositor eye-candy, switch the CPU governor to `power-saver`,
-pause user-chosen systemd services, and darken the keyboard backlight. When
-power returns (or the battery recovers), every change is restored *exactly* as
-it was.
-
-Idle config, pause lists and history are never touched by engagement — the
-emergency profile lives entirely in runtime state, so a crash, logout or botched
+A native [Omarchy](https://omarchy.org/) battery brownout plugin: a status-bar
+leaf with an emergency popup that reacts the moment your laptop unplugs or its
+battery drops low — dims the display, strips compositor eye-candy, switches to
+`power-saver`, pauses user-chosen systemd services — and restores every value
+exactly when power returns. Nothing pauses by default, nothing touches your
+saved config, and every action lives in runtime state so a crash or botched
 release can never break your setup.
 
-| Inactive (idle) | Engaged (on battery) |
-|---|---|
-| ![Brownout popup, inactive](screenshots/popup-idle.png) | ![Brownout popup, engaged](screenshots/popup-engaged.png) |
+<p align="center">
+  <img src="preview.png" alt="Brownout popup: inactive on AC (left) and engaged on battery (right)" width="100%">
+</p>
 
 ---
 

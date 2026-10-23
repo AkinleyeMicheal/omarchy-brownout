@@ -84,7 +84,8 @@ tmp="$DEST.new.$$"
 rm -rf "$tmp"
 mkdir -p "$tmp"
 (cd "$SRC" && tar --exclude=.git --exclude=install.sh --exclude=tests --exclude=screenshots \
-  --exclude=.gitignore --exclude=LICENSE --exclude=README.md --exclude=__pycache__ --exclude='*.pyc' -cf - .) | (cd "$tmp" && tar -xf -)
+  --exclude=preview.png --exclude=.gitignore --exclude=LICENSE --exclude=README.md \
+  --exclude=__pycache__ --exclude='*.pyc' -cf - .) | (cd "$tmp" && tar -xf -)
 chmod +x "$tmp"/bin/* "$tmp"/hooks/*.sh
 # A previous interrupted copy left a zero-padded file behind; refuse to install
 # anything empty or carrying NUL padding.
